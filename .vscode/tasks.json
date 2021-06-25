@@ -10,7 +10,24 @@
         "${workspaceFolder}/samples/StackExchange.Redis.Samples.Web.Mvc/StackExchange.Redis.Samples.Web.Mvc.csproj",
         "/property:GenerateFullPaths=true",
         "/consoleloggerparameters:NoSummary",
-        "-f:netcoreapp3.1"
+        "-f:net5.0"
+      ],
+      "problemMatcher": "$msCompile",
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      }
+    },
+    {
+      "label": "build solution net5",
+      "command": "dotnet",
+      "type": "process",
+      "args": [
+        "build",
+        "${workspaceFolder}/StackExchange.Redis.Extensions.sln",
+        "/property:GenerateFullPaths=true",
+        "/consoleloggerparameters:NoSummary",
+        "-f:net5.0"
       ],
       "problemMatcher": "$msCompile",
       "group": {

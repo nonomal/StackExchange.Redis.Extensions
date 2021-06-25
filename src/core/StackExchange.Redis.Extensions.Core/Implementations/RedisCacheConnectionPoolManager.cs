@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Concurrent;
 using System.Linq;
+using System.Runtime.InteropServices;
 
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -14,9 +15,12 @@ namespace StackExchange.Redis.Extensions.Core.Implementations
     /// <inheritdoc/>
     public class RedisCacheConnectionPoolManager : IRedisCacheConnectionPoolManager
     {
-        private readonly ConcurrentBag<Lazy<IStateAwareConnection>> connections;
+        private readonly IStateAwareConnection[] connections;
         private readonly RedisConfiguration redisConfiguration;
         private readonly ILogger<RedisCacheConnectionPoolManager> logger;
+        private bool isDisposed;
+        private IntPtr nativeResource = Marshal.AllocHGlobal(100);
+        private static readonly object @lock = new();
 
         /// <summary>
         /// Initializes a new instance of the <see cref="RedisCacheConnectionPoolManager"/> class.
@@ -26,49 +30,53 @@ namespace StackExchange.Redis.Extensions.Core.Implementations
         public RedisCacheConnectionPoolManager(RedisConfiguration redisConfiguration, ILogger<RedisCacheConnectionPoolManager> logger = null)
         {
             this.redisConfiguration = redisConfiguration ?? throw new ArgumentNullException(nameof(redisConfiguration));
-
-            this.connections = new ConcurrentBag<Lazy<IStateAwareConnection>>();
             this.logger = logger ?? NullLogger<RedisCacheConnectionPoolManager>.Instance;
+
+            lock (@lock)
+            {
+                this.connections = new IStateAwareConnection[redisConfiguration.PoolSize];
+                this.EmitConnections();
+            }
         }
 
         /// <inheritdoc/>
         public void Dispose()
         {
-            foreach (var connection in this.connections)
-            {
-                if (!connection.IsValueCreated)
-                    continue;
+            Dispose(true);
+            GC.SuppressFinalize(this);
+        }
 
-                connection.Value.Dispose();
+        /// <inheritdoc/>
+        protected virtual void Dispose(bool disposing)
+        {
+            if (isDisposed)
+                return;
+
+            if (disposing)
+            {
+                // free managed resources
+                foreach (var connection in this.connections)
+                    connection.Dispose();
             }
 
-            while (!this.connections.IsEmpty)
-                this.connections.TryTake(out var taken);
+            // free native resources if there are any.
+            if (nativeResource != IntPtr.Zero)
+            {
+                Marshal.FreeHGlobal(nativeResource);
+                nativeResource = IntPtr.Zero;
+            }
+
+            isDisposed = true;
         }
 
         /// <inheritdoc/>
         public IConnectionMultiplexer GetConnection()
         {
-            this.EmitConnections();
+            var connection = this.connections.OrderBy(x => x.TotalOutstanding()).First();
 
-            var loadedLazies = this.connections.Count(lazy => lazy.IsValueCreated);
+            logger.LogDebug("Using connection {0} with {1} outstanding!", connection.Connection.GetHashCode(), connection.TotalOutstanding());
 
-            if (loadedLazies == this.connections.Count)
-                return this.connections.OrderBy(x => x.Value.TotalOutstanding()).First().Value.Connection;
-
-            foreach (var connection in this.connections)
-            {
-                if (!connection.IsValueCreated)
-                    return connection.Value.Connection;
-
-                // This mean there is an active connection that is not doing anything
-                if (connection.Value.TotalOutstanding() == 0)
-                    return connection.Value.Connection;
-            }
-
-            logger.LogWarning("Fall back on the first available connection");
-
-            return this.connections.First().Value.Connection;
+            return connection.Connection;
         }
 
         /// <inheritdoc/>
@@ -76,17 +84,10 @@ namespace StackExchange.Redis.Extensions.Core.Implementations
         {
             var activeConnections = 0;
             var invalidConnections = 0;
-            var readyNotUsedYet = 0;
 
-            foreach (var lazy in connections)
+            foreach (var connection in connections)
             {
-                if (!lazy.IsValueCreated)
-                {
-                    readyNotUsedYet++;
-                    continue;
-                }
-
-                if (!lazy.Value.IsConnected())
+                if (!connection.IsConnected())
                 {
                     invalidConnections++;
                     continue;
@@ -99,35 +100,20 @@ namespace StackExchange.Redis.Extensions.Core.Implementations
             {
                 RequiredPoolSize = redisConfiguration.PoolSize,
                 ActiveConnections = activeConnections,
-                InvalidConnections = invalidConnections,
-                ReadyNotUsedYet = readyNotUsedYet
+                InvalidConnections = invalidConnections
             };
         }
 
-        private void EmitConnection()
+        private void EmitConnections()
         {
-            this.connections.Add(new Lazy<IStateAwareConnection>(() =>
+            for (var i = 0; i < this.redisConfiguration.PoolSize; i++)
             {
-                this.logger.LogDebug("Creating new Redis connection.");
-
                 var multiplexer = ConnectionMultiplexer.Connect(redisConfiguration.ConfigurationOptions);
 
                 if (this.redisConfiguration.ProfilingSessionProvider != null)
                     multiplexer.RegisterProfiler(this.redisConfiguration.ProfilingSessionProvider);
 
-                return this.redisConfiguration.StateAwareConnectionFactory(multiplexer, logger);
-            }));
-        }
-
-        private void EmitConnections()
-        {
-            if (connections.Count >= this.redisConfiguration.PoolSize)
-                return;
-
-            for (var i = 0; i < this.redisConfiguration.PoolSize; i++)
-            {
-                logger.LogDebug("Creating the redis connection pool with {0} connections.", this.redisConfiguration.PoolSize);
-                this.EmitConnection();
+                this.connections[i] = this.redisConfiguration.StateAwareConnectionFactory(multiplexer, logger);
             }
         }
 
@@ -150,6 +136,8 @@ namespace StackExchange.Redis.Extensions.Core.Implementations
                 this.Connection = multiplexer ?? throw new ArgumentNullException(nameof(multiplexer));
                 this.Connection.ConnectionFailed += this.ConnectionFailed;
                 this.Connection.ConnectionRestored += this.ConnectionRestored;
+                this.Connection.InternalError += this.InternalError;
+                this.Connection.ErrorMessage += this.ErrorMessage;
 
                 this.logger = logger;
             }
@@ -164,6 +152,8 @@ namespace StackExchange.Redis.Extensions.Core.Implementations
             {
                 this.Connection.ConnectionFailed -= ConnectionFailed;
                 this.Connection.ConnectionRestored -= ConnectionRestored;
+                this.Connection.InternalError -= this.InternalError;
+                this.Connection.ErrorMessage -= this.ErrorMessage;
 
                 Connection.Dispose();
             }
@@ -176,6 +166,16 @@ namespace StackExchange.Redis.Extensions.Core.Implementations
             private void ConnectionRestored(object sender, ConnectionFailedEventArgs e)
             {
                 logger.LogError("Redis connection error restored.");
+            }
+
+            private void InternalError(object sender, InternalErrorEventArgs e)
+            {
+                logger.LogError(e.Exception, "Redis internal error {0}.", e.Origin);
+            }
+
+            private void ErrorMessage(object sender, RedisErrorEventArgs e)
+            {
+                logger.LogError("Redis error: " + e.Message);
             }
         }
     }
